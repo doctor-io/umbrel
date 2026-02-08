@@ -2,27 +2,367 @@
 set -euo pipefail
 
 # This script is exposed via: curl -L https://umbrel.sh | bash
-# Which resolves to this file in the master branch of this repo
+#
+# Installs Umbrel as a system service on Debian/Ubuntu/Raspberry Pi OS.
+#
+# Optional environment overrides:
+#   UMBREL_REPO        (default: https://github.com/getumbrel/umbrel)
+#   UMBREL_REF         (default: master)
+#   UMBREL_INSTALL_DIR (default: /opt/umbrel)
+#   UMBREL_DATA_DIR    (default: /home/umbrel/umbrel)
+#   UMBREL_HOSTNAME    (default: umbrel)
+#   UMBREL_ALLOW_OTHER_NODE=true (skip installing Node even if version differs)
+#   UMBREL_INSTALL_EXTRAS=true (install extra OS packages/services)
 
-cat << "EOF"
+UMBREL_REPO="${UMBREL_REPO:-https://github.com/getumbrel/umbrel}"
+UMBREL_REF="${UMBREL_REF:-master}"
+UMBREL_INSTALL_DIR="${UMBREL_INSTALL_DIR:-/opt/umbrel}"
+UMBREL_DATA_DIR="${UMBREL_DATA_DIR:-/home/umbrel/umbrel}"
+UMBREL_HOSTNAME="${UMBREL_HOSTNAME:-}"
+UMBREL_ALLOW_OTHER_NODE="${UMBREL_ALLOW_OTHER_NODE:-false}"
+UMBREL_INSTALL_EXTRAS="${UMBREL_INSTALL_EXTRAS:-true}"
 
-                ,;###GGGGGGGGGGl#Sp
-             ,##GGGlW""^'  '`""%GGGG#S,
-           ,#GGG"                  "lGG#o
-          #GGl^                      '$GG#
-        ,#GGb         umbrelOS         \GGG,
-        lGG"                            "GGG
-       #GGGlGGGl##p,,p##lGGl##p,,p###ll##GGGG
-      !GGGlW"""*GGGGGGG#""""WlGGGGG#W""*WGGGGS
-       ""          "^          '"          ""
+DOCKER_VERSION="28.5.0"
+DOCKER_INSTALL_SCRIPT_COMMIT="5c8855edd778525564500337f5ac4ad65a0c168e"
 
---------------------------------------------------------------------------
-|                                                                        |
-|  With the release of umbrelOS 1.0, umbrelOS now needs to be installed  |
-|  directly as the operating system on your device's internal storage,   |
-|  not on top of an existing OS like Debian or Ubuntu. Check out our     |
-|  step-by-step guide at https://link.umbrel.com/install-umbrelos        |
-|                                                                        |
---------------------------------------------------------------------------
+NODE_VERSION="22.13.0"
+NODE_SHA256_x64="9a33e89093a0d946c54781dcb3ccab4ccf7538a7135286528ca41ca055e9b38f"
+NODE_SHA256_arm64="e0cc088cb4fb2e945d3d5c416c601e1101a15f73e0f024c9529b964d9f6dce5b"
 
+YQ_VERSION="4.24.5"
+YQ_SHA256_amd64="c93a696e13d3076e473c3a43c06fdb98fafd30dc2f43bc771c4917531961c760"
+YQ_SHA256_arm64="8879e61c0b3b70908160535ea358ec67989ac4435435510e1fcb2eda5d74a0e9"
+
+log() {
+	echo "umbrel-install: $*"
+}
+
+die() {
+	echo "umbrel-install: $*" >&2
+	exit 1
+}
+
+require_root() {
+	if [[ "${EUID}" -ne 0 ]]; then
+		die "Please run as root (e.g., sudo bash)."
+	fi
+}
+
+command_exists() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+detect_arch() {
+	case "$(uname -m)" in
+		x86_64)
+			echo "x64"
+			;;
+		aarch64)
+			echo "arm64"
+			;;
+		*)
+			die "Unsupported architecture: $(uname -m). Supported: x86_64, aarch64."
+			;;
+	esac
+}
+
+ensure_apt() {
+	command_exists apt-get || die "This installer supports Debian/Ubuntu/Raspberry Pi OS only (apt-get required)."
+}
+
+normalize_hostname() {
+	local input="${1:-}"
+	# Remove whitespace and lowercase
+	input="$(echo "${input}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+	# Strip .local if provided
+	if [[ "${input}" == *.local ]]; then
+		input="${input%.local}"
+	fi
+	# Default if empty
+	if [[ -z "${input}" ]]; then
+		input="umbrel"
+	fi
+	# Basic validation (allow dots for FQDN)
+	if ! [[ "${input}" =~ ^[a-z0-9][a-z0-9.-]{0,62}$ ]]; then
+		die "Invalid hostname: ${input}. Use letters, numbers, hyphens, and dots."
+	fi
+	echo "${input}"
+}
+
+configure_hostname() {
+	local desired="${UMBREL_HOSTNAME}"
+
+	if [[ -z "${desired}" && -t 0 ]]; then
+		echo "Enter the hostname for Umbrel (used as <hostname>.local)."
+		read -r -p "Hostname [umbrel]: " desired
+	fi
+
+	desired="$(normalize_hostname "${desired}")"
+
+	if command_exists hostnamectl; then
+		hostnamectl set-hostname "${desired}"
+	else
+		echo "${desired}" >/etc/hostname
+		hostname "${desired}"
+	fi
+
+	local hosts_entry="127.0.1.1 ${desired}"
+	if [[ "${desired}" != *.* ]]; then
+		hosts_entry="${hosts_entry} ${desired}.local"
+	fi
+
+	if grep -qE '^127\.0\.1\.1' /etc/hosts; then
+		sed -i "s|^127\.0\.1\.1.*|${hosts_entry}|" /etc/hosts
+	else
+		echo "${hosts_entry}" >>/etc/hosts
+	fi
+
+	if [[ "${desired}" == *.* ]]; then
+		log "Hostname set to ${desired}. Configure DNS to point this name to the server."
+	else
+		log "Hostname set to ${desired}. Access via http://${desired}.local"
+	fi
+}
+
+install_packages() {
+	log "Installing system dependencies..."
+	apt-get update -y
+	apt-get install -y \
+		ca-certificates \
+		curl \
+		gnupg \
+		git \
+		jq \
+		rsync \
+		python3 \
+		build-essential \
+		libudev-dev \
+		tar \
+		xz-utils \
+		unzip \
+		procps
+}
+
+install_extras() {
+	if [[ "${UMBREL_INSTALL_EXTRAS}" != "true" ]]; then
+		log "Skipping full extras install (UMBREL_INSTALL_EXTRAS=${UMBREL_INSTALL_EXTRAS})."
+		return
+	fi
+
+	log "Installing full extras..."
+	apt-get install -y \
+		network-manager \
+		systemd-timesyncd \
+		openssh-server \
+		avahi-daemon \
+		avahi-discover \
+		avahi-utils \
+		libnss-mdns \
+		bluez \
+		sudo \
+		nano \
+		vim \
+		less \
+		man \
+		iproute2 \
+		iputils-ping \
+		wget \
+		usbutils \
+		whois \
+		fswatch \
+		gettext-base \
+		dmidecode \
+		unar \
+		imagemagick \
+		ffmpeg \
+		samba \
+		wsdd2 \
+		cifs-utils \
+		smbclient \
+		gdisk \
+		parted \
+		e2fsprogs \
+		exfatprogs
+
+	# ntfs-3g only on amd64 (same as umbrelOS build)
+	if [[ "$(detect_arch)" == "x64" ]]; then
+		apt-get install -y ntfs-3g
+	fi
+
+	# Let umbreld manage these when needed
+	systemctl disable smbd wsdd2 >/dev/null 2>&1 || true
+	systemctl enable --now avahi-daemon >/dev/null 2>&1 || true
+}
+
+install_docker() {
+	if command_exists docker; then
+		log "Docker already installed."
+		return
+	fi
+
+	log "Installing Docker ${DOCKER_VERSION}..."
+	curl -fsSL "https://raw.githubusercontent.com/docker/docker-install/${DOCKER_INSTALL_SCRIPT_COMMIT}/install.sh" -o /tmp/install-docker.sh
+	sh /tmp/install-docker.sh --version "v${DOCKER_VERSION}"
+	rm -f /tmp/install-docker.sh
+
+	systemctl enable --now docker
+}
+
+install_node() {
+	local arch
+	arch="$(detect_arch)"
+
+	if command_exists node; then
+		local current
+		current="$(node -v | sed 's/^v//')"
+		if [[ "${current}" == "${NODE_VERSION}" ]]; then
+			log "Node ${NODE_VERSION} already installed."
+			return
+		fi
+		if [[ "${UMBREL_ALLOW_OTHER_NODE}" == "true" ]]; then
+			log "Using existing Node ${current} (UMBREL_ALLOW_OTHER_NODE=true)."
+			return
+		fi
+		log "Existing Node ${current} detected; installing Node ${NODE_VERSION}."
+	fi
+
+	local node_tar="node-v${NODE_VERSION}-linux-${arch}.tar.gz"
+	local node_url="https://nodejs.org/dist/v${NODE_VERSION}/${node_tar}"
+	local sha_var="NODE_SHA256_${arch}"
+	local sha_expected="${!sha_var:-}"
+
+	[[ -n "${sha_expected}" ]] || die "Missing SHA256 for Node arch: ${arch}"
+
+	log "Installing Node ${NODE_VERSION}..."
+	curl -fsSL "${node_url}" -o "/tmp/${node_tar}"
+	echo "${sha_expected}  /tmp/${node_tar}" | sha256sum -c -
+	tar -xzf "/tmp/${node_tar}" -C /usr/local --strip-components=1
+	rm -f "/tmp/${node_tar}"
+}
+
+install_yq() {
+	if command_exists yq; then
+		log "yq already installed."
+		return
+	fi
+
+	local arch
+	arch="$(detect_arch)"
+	local yq_arch="arm64"
+	local yq_sha="${YQ_SHA256_arm64}"
+	if [[ "${arch}" == "x64" ]]; then
+		yq_arch="amd64"
+		yq_sha="${YQ_SHA256_amd64}"
+	fi
+
+	log "Installing yq ${YQ_VERSION}..."
+	curl -fsSL "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${yq_arch}" -o /usr/local/bin/yq
+	echo "${yq_sha}  /usr/local/bin/yq" | sha256sum -c -
+	chmod +x /usr/local/bin/yq
+}
+
+install_pnpm() {
+	if command_exists pnpm; then
+		log "pnpm already installed."
+		return
+	fi
+	if command_exists corepack; then
+		corepack enable
+		corepack prepare pnpm@8 --activate
+	else
+		npm install -g pnpm@8
+	fi
+}
+
+clone_or_update_repo() {
+	if [[ -d "${UMBREL_INSTALL_DIR}/.git" ]]; then
+		log "Updating existing repo in ${UMBREL_INSTALL_DIR}..."
+		git -C "${UMBREL_INSTALL_DIR}" fetch --all --tags
+		git -C "${UMBREL_INSTALL_DIR}" checkout "${UMBREL_REF}"
+		git -C "${UMBREL_INSTALL_DIR}" pull --ff-only || true
+	elif [[ -d "${UMBREL_INSTALL_DIR}" ]]; then
+		die "Install directory ${UMBREL_INSTALL_DIR} exists but is not a git repo. Move it or set UMBREL_INSTALL_DIR."
+	else
+		log "Cloning ${UMBREL_REPO} into ${UMBREL_INSTALL_DIR}..."
+		git clone "${UMBREL_REPO}" "${UMBREL_INSTALL_DIR}"
+		git -C "${UMBREL_INSTALL_DIR}" checkout "${UMBREL_REF}"
+	fi
+}
+
+build_ui() {
+	log "Building UI..."
+	pushd "${UMBREL_INSTALL_DIR}/packages/ui" >/dev/null
+	pnpm install
+	pnpm run build
+	popd >/dev/null
+
+	# umbreld serves UI from /opt/umbrel/packages/umbreld/ui
+	rm -rf "${UMBREL_INSTALL_DIR}/packages/umbreld/ui"
+	cp -r "${UMBREL_INSTALL_DIR}/packages/ui/dist" "${UMBREL_INSTALL_DIR}/packages/umbreld/ui"
+}
+
+install_umbreld() {
+	log "Installing umbreld..."
+	pushd "${UMBREL_INSTALL_DIR}/packages/umbreld" >/dev/null
+	# Use system headers from /usr/local for native addons (e.g., drivelist)
+	NPM_CONFIG_NODEDIR=/usr/local npm clean-install --omit dev
+	popd >/dev/null
+
+	install -d /usr/local/bin
+	ln -sf "${UMBREL_INSTALL_DIR}/packages/umbreld/umbreld" /usr/local/bin/umbreld
+}
+
+ensure_user_and_data_dir() {
+	if ! id -u umbrel >/dev/null 2>&1; then
+		log "Creating umbrel user..."
+		useradd --create-home --shell /bin/bash umbrel
+	fi
+	mkdir -p "${UMBREL_DATA_DIR}"
+	chown -R umbrel:umbrel "${UMBREL_DATA_DIR}"
+}
+
+install_systemd_service() {
+	log "Installing systemd service..."
+	cat >/etc/systemd/system/umbrel.service <<EOF
+[Unit]
+Description=Umbrel daemon
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+TimeoutStopSec=15min
+ExecStart=/usr/local/bin/umbreld --data-directory=${UMBREL_DATA_DIR}
+Restart=always
+StartLimitInterval=0
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
 EOF
+
+	systemctl daemon-reload
+	systemctl enable --now umbrel
+}
+
+main() {
+	require_root
+	ensure_apt
+
+	install_packages
+	install_extras
+	configure_hostname
+	install_docker
+	install_node
+	install_yq
+	install_pnpm
+	clone_or_update_repo
+	build_ui
+	install_umbreld
+	ensure_user_and_data_dir
+	install_systemd_service
+
+	log "Umbrel installed and running."
+	log "UI will be available once the service finishes booting."
+}
+
+main "$@"

@@ -1,6 +1,6 @@
 // TODO: this should all probably be in umbreld
 
-import {FilesGridWidget, FilesListWidget, filesWidgetTypes} from '@/features/files/widgets'
+import { FilesGridWidget, FilesListWidget, filesWidgetTypes } from '@/features/files/widgets'
 
 export const DEFAULT_REFRESH_MS = 1000 * 60 * 5
 
@@ -155,11 +155,7 @@ export type RegistryWidget<T extends WidgetType = WidgetType> = {
 
 export const MAX_WIDGETS = 3
 
-export const liveUsageWidgets: [
-	RegistryWidget<'text-with-progress'>,
-	RegistryWidget<'text-with-progress'>,
-	RegistryWidget<'three-stats'>,
-] = [
+export const liveUsageWidgets: RegistryWidget[] = [
 	{
 		id: 'umbrel:storage',
 		type: 'text-with-progress',
@@ -200,6 +196,29 @@ export const liveUsageWidgets: [
 					icon: 'system-widget-storage',
 					subtext: 'Storage',
 					text: '1.75 TB',
+				},
+			],
+		},
+	},
+	{
+		id: 'umbrel:network',
+		type: 'three-stats',
+		example: {
+			items: [
+				{
+					icon: 'download',
+					subtext: 'Down',
+					text: '120 Mbps',
+				},
+				{
+					icon: 'upload',
+					subtext: 'Up',
+					text: '12 Mbps',
+				},
+				{
+					icon: 'network',
+					subtext: 'IP',
+					text: '192.168.1.2',
 				},
 			],
 		},
